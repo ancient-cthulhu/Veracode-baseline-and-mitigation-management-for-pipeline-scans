@@ -1,0 +1,47 @@
+# Copy this file into a consuming repository as .github/workflows/veracode.yml
+#
+# Default behaviour:
+#   push to the default branch -> refresh the stored baselines
+#   pull request               -> delta scan against those baselines
+#   manual run                 -> whatever you pick in the Run workflow dialog
+
+name: Veracode
+
+on:
+  push:
+    # Replace with your default branch if it is not main. This is the branch
+    # whose scan results become the baseline.
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  pull_request:
+  schedule:
+    # Weekly refresh so the baseline follows platform side mitigation changes.
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'auto, baseline or delta'
+        type: choice
+        options: [auto, baseline, delta]
+        default: auto
+      baseline_branch:
+        description: 'Branch to use as the baseline. Empty means the default branch.'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  # Only needed when upload_sarif is true.
+  security-events: write
+
+jobs:
+  veracode:
+    uses: Veracode-CSE-Demos/veracode-ci-templates/.github/workflows/veracode-pipeline.yml@main
+    secrets: inherit
+    with:
+      mode: ${{ inputs.mode || 'auto' }}
+      baseline_branch: ${{ inputs.baseline_branch || '' }}
+      fail_on_severity: 'Very High, High'
+      upload_sarif: true
