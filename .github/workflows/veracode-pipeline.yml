@@ -1,0 +1,680 @@
+name: Veracode Pipeline Scan
+
+# One reusable workflow that owns both halves of baseline management.
+#
+#   push to the baseline branch  -> rescan and refresh the stored baselines
+#   any other ref or a PR        -> delta scan against those stored baselines
+#
+# The baseline branch is the repository default branch unless the caller sets
+# baseline_branch. Baselines are always keyed by the BASELINE branch, never by
+# the branch that happens to be running, so every feature branch and pull
+# request compares against the same source of truth.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: 'auto | baseline | delta. auto refreshes baselines on the baseline branch and delta scans everywhere else.'
+        type: string
+        default: auto
+      baseline_branch:
+        description: 'Branch that owns the baselines. Empty means the repository default branch.'
+        type: string
+        default: ''
+      baseline_repo:
+        description: 'Repository that stores the baseline files.'
+        type: string
+        default: Veracode-CSE-Demos/veracode-ci-templates
+      baseline_store_branch:
+        description: 'Branch inside baseline_repo where baselines are committed. Empty means that repository default branch.'
+        type: string
+        default: ''
+      baseline_type:
+        description: 'full | mitigated | both. Which stored baseline the delta scan compares against. both costs two scans per artifact.'
+        type: string
+        default: full
+      templates_repo:
+        description: 'Repository holding this workflow and its helper scripts.'
+        type: string
+        default: Veracode-CSE-Demos/veracode-ci-templates
+      fail_on_severity:
+        description: 'Severities that fail a delta scan.'
+        type: string
+        default: 'Very High, High'
+      fail_on_cwe:
+        description: 'Comma separated CWE list that fails a delta scan regardless of severity.'
+        type: string
+        default: ''
+      policy_name:
+        description: 'Veracode policy name used to rate findings. Empty uses the scanner default.'
+        type: string
+        default: ''
+      strict_baselines:
+        description: 'Fail the delta job when an artifact has no stored baseline.'
+        type: boolean
+        default: false
+      artifacts_glob:
+        description: 'Glob of prebuilt artifacts to scan. When set, the Veracode CLI autopackager is skipped entirely.'
+        type: string
+        default: ''
+      package_source:
+        description: 'Source path passed to veracode package.'
+        type: string
+        default: '.'
+      artifact_extensions:
+        description: 'Space separated extensions treated as scannable artifacts.'
+        type: string
+        default: 'jar war ear dll exe nupkg zip tar tgz tar.gz'
+      scan_timeout:
+        description: 'Pipeline Scan timeout in minutes.'
+        type: number
+        default: 60
+      java_version:
+        description: 'JDK used to run pipeline-scan.jar.'
+        type: string
+        default: '17'
+      python_version:
+        description: 'Python used for the mitigation overlay and the reporting helpers.'
+        type: string
+        default: '3.12'
+      runs_on:
+        description: 'Runner label.'
+        type: string
+        default: ubuntu-latest
+      upload_results:
+        description: 'Upload raw scan results as a workflow artifact.'
+        type: boolean
+        default: true
+      upload_sarif:
+        description: 'Publish delta findings to code scanning. The calling job needs security-events write.'
+        type: boolean
+        default: false
+      source_path_prefix:
+        description: 'Prefix added to finding paths in SARIF so they resolve in the repo, for example src/main/java.'
+        type: string
+        default: ''
+      app_name:
+        description: 'Veracode application profile name. Overrides the VERACODE_APP_NAME secret. Empty falls back to the secret, then to org/repo.'
+        type: string
+        default: ''
+      mitigation_script_url:
+        description: 'Raw URL of vcpipemit.py.'
+        type: string
+        default: https://raw.githubusercontent.com/veracode/veracode-pipeline-mitigation/master/vcpipemit.py
+      mitigation_requirements_url:
+        description: 'Raw URL of the mitigation script requirements file.'
+        type: string
+        default: https://raw.githubusercontent.com/veracode/veracode-pipeline-mitigation/master/requirements.txt
+    secrets:
+      VERACODE_API_ID:
+        description: 'Veracode API ID.'
+        required: false
+      VERACODE_API_KEY:
+        description: 'Veracode API key.'
+        required: false
+      VERACODE_APP_NAME:
+        description: 'Veracode application profile name. Optional, defaults to org/repo.'
+        required: false
+      CI_PUSH_TOKEN_VCT:
+        description: 'PAT with read access to the baseline repo, and write access when refreshing baselines.'
+        required: false
+    outputs:
+      mode:
+        description: 'Resolved mode, baseline or delta.'
+        value: ${{ jobs.veracode.outputs.mode }}
+      baseline_branch:
+        description: 'Branch the baselines are keyed on.'
+        value: ${{ jobs.veracode.outputs.baseline_branch }}
+      baseline_path:
+        description: 'Path of the baselines inside the baseline repository.'
+        value: ${{ jobs.veracode.outputs.baseline_path }}
+
+jobs:
+  veracode:
+    name: Veracode
+    runs-on: ${{ inputs.runs_on }}
+
+    # A baseline refresh is never cancelled halfway. Superseded pull request
+    # scans are dropped so stale commits do not burn scan capacity.
+    concurrency:
+      group: veracode-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+    outputs:
+      mode: ${{ steps.prep.outputs.mode }}
+      baseline_branch: ${{ steps.prep.outputs.baseline_branch }}
+      baseline_path: ${{ steps.prep.outputs.store_path }}
+
+    env:
+      AUTOPACK_OUT_DIR: verascan
+      BASELINE_WORKTREE: .veracode-baselines
+      HELPERS: .veracode-templates/scripts
+      BASELINE_FULL: baseline.json
+      BASELINE_MITIGATED: baseline-mitigated-findings.json
+      # Everything crosses into bash through env rather than ${{ }} inside a run
+      # block, so a branch name or app name can never break out into the shell.
+      IN_MODE: ${{ inputs.mode }}
+      IN_BASELINE_BRANCH: ${{ inputs.baseline_branch }}
+      IN_BASELINE_REPO: ${{ inputs.baseline_repo }}
+      IN_BASELINE_TYPE: ${{ inputs.baseline_type }}
+      IN_APP_NAME: ${{ inputs.app_name }}
+      IN_EXTENSIONS: ${{ inputs.artifact_extensions }}
+      IN_ARTIFACTS_GLOB: ${{ inputs.artifacts_glob }}
+      IN_PACKAGE_SOURCE: ${{ inputs.package_source }}
+      IN_FAIL_ON_SEVERITY: ${{ inputs.fail_on_severity }}
+      IN_FAIL_ON_CWE: ${{ inputs.fail_on_cwe }}
+      IN_POLICY_NAME: ${{ inputs.policy_name }}
+      IN_STRICT: ${{ inputs.strict_baselines }}
+      IN_TIMEOUT: ${{ inputs.scan_timeout }}
+      IN_SOURCE_PREFIX: ${{ inputs.source_path_prefix }}
+      SECRET_APP_NAME: ${{ secrets.VERACODE_APP_NAME }}
+      PROJECT_URL: ${{ github.server_url }}/${{ github.repository }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve baseline target
+        id: prep
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HAS_API_ID: ${{ secrets.VERACODE_API_ID != '' }}
+          HAS_API_KEY: ${{ secrets.VERACODE_API_KEY != '' }}
+          HAS_PUSH_TOKEN: ${{ secrets.CI_PUSH_TOKEN_VCT != '' }}
+        run: |
+          set -euo pipefail
+
+          if [ "$HAS_API_ID" != "true" ] || [ "$HAS_API_KEY" != "true" ]; then
+            echo "::error::VERACODE_API_ID and VERACODE_API_KEY are not available to this run."
+            echo "Pull requests from forks never receive secrets. Scan a branch in this repository instead."
+            exit 1
+          fi
+          if [ "$HAS_PUSH_TOKEN" != "true" ]; then
+            echo "::error::CI_PUSH_TOKEN_VCT is required to read and write the baseline repository."
+            exit 1
+          fi
+
+          # 1. Which branch owns the baselines.
+          BASELINE_BRANCH="$IN_BASELINE_BRANCH"
+          [ -n "$BASELINE_BRANCH" ] || BASELINE_BRANCH="$EVENT_DEFAULT_BRANCH"
+          if [ -z "$BASELINE_BRANCH" ]; then
+            # Scheduled runs do not always carry the repository object.
+            BASELINE_BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          fi
+          [ -n "$BASELINE_BRANCH" ] || { echo "::error::Could not resolve the baseline branch."; exit 1; }
+
+          # 2. Which branch is actually running.
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            CURRENT_REF="$GITHUB_HEAD_REF"
+          else
+            CURRENT_REF="$GITHUB_REF_NAME"
+          fi
+
+          # 3. What this run should do.
+          case "$IN_MODE" in
+            baseline|delta)
+              MODE="$IN_MODE"
+              ;;
+            auto)
+              if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+                MODE=delta
+              elif [ "$CURRENT_REF" = "$BASELINE_BRANCH" ]; then
+                MODE=baseline
+              else
+                MODE=delta
+              fi
+              ;;
+            *)
+              echo "::error::mode must be auto, baseline or delta (got '${IN_MODE}')."
+              exit 1
+              ;;
+          esac
+
+          case "$IN_BASELINE_TYPE" in
+            full|mitigated|both) ;;
+            *) echo "::error::baseline_type must be full, mitigated or both (got '${IN_BASELINE_TYPE}')."; exit 1 ;;
+          esac
+
+          # Application profile name: app_name input, then VERACODE_APP_NAME
+          # secret, then the scanned repository as org/repo.
+          APP_NAME="$IN_APP_NAME"
+          [ -n "$APP_NAME" ] || APP_NAME="$SECRET_APP_NAME"
+          if [ -z "$APP_NAME" ]; then
+            APP_NAME="$GITHUB_REPOSITORY"
+            echo "::notice::No Veracode application name supplied. Using '${APP_NAME}' derived from the repository."
+          fi
+          WANT_MITIGATED=true
+
+          REPO_SLUG="${GITHUB_REPOSITORY//\//_}"
+          BRANCH_KEY="$(printf '%s' "$BASELINE_BRANCH" | sed 's#[^A-Za-z0-9._-]#_#g')"
+          STORE_PATH="baselines/${REPO_SLUG}/${BRANCH_KEY}"
+
+          IS_BASELINE=false; IS_DELTA=false
+          [ "$MODE" = baseline ] && IS_BASELINE=true || IS_DELTA=true
+
+          {
+            echo "mode=$MODE"
+            echo "baseline_branch=$BASELINE_BRANCH"
+            echo "current_ref=$CURRENT_REF"
+            echo "store_path=$STORE_PATH"
+            echo "is_baseline=$IS_BASELINE"
+            echo "is_delta=$IS_DELTA"
+            echo "want_mitigated=$WANT_MITIGATED"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "MODE=$MODE"
+            echo "BASELINE_BRANCH=$BASELINE_BRANCH"
+            echo "CURRENT_REF=$CURRENT_REF"
+            echo "STORE_PATH=$STORE_PATH"
+            echo "APP_NAME=$APP_NAME"
+            echo "WANT_MITIGATED=$WANT_MITIGATED"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "### Veracode run plan"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---|---|"
+            echo "| Mode | \`${MODE}\` |"
+            echo "| Running ref | \`${CURRENT_REF}\` |"
+            echo "| Baseline branch | \`${BASELINE_BRANCH}\` |"
+            echo "| Baseline store | \`${IN_BASELINE_REPO}:${STORE_PATH}\` |"
+            echo "| Baseline type | \`${IN_BASELINE_TYPE}\` |"
+            echo "| Application profile | \`${APP_NAME}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write Veracode credentials file
+        shell: bash
+        env:
+          VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+        run: |
+          set -euo pipefail
+          # A credentials file keeps the API key off every process command line
+          # for the CLI, the scanner and the mitigation script alike.
+          mkdir -p "$HOME/.veracode"
+          umask 177
+          printf '[default]\nveracode_api_key_id = %s\nveracode_api_key_secret = %s\n' \
+            "$VERACODE_API_ID" "$VERACODE_API_KEY" > "$HOME/.veracode/credentials"
+          : > "$HOME/.veracode/veracode.yml"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install Veracode CLI
+        if: inputs.artifacts_glob == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Installed outside the workspace so the autopackager cannot sweep the
+          # CLI itself into a scanned artifact.
+          INSTALL_DIR="${RUNNER_TEMP}/veracode-cli"
+          mkdir -p "$INSTALL_DIR"
+          cd "$INSTALL_DIR"
+          curl -fsS --retry 3 --retry-delay 5 -O https://tools.veracode.com/veracode-cli/install
+          chmod +x ./install
+          ./install | tee install.log
+          CLI_DIR="$(awk -F'"' '/copying files into/ {print $2; exit}' install.log)"
+          if [ -z "${CLI_DIR:-}" ] || [ ! -x "${CLI_DIR}/veracode" ]; then
+            # Install log format changed: fall back to locating the binary.
+            CLI_BIN="$(find "$INSTALL_DIR" -maxdepth 3 -type f -name veracode -perm -u+x | head -n1)"
+            CLI_DIR="$(dirname "${CLI_BIN:-/nonexistent}")"
+          fi
+          [ -x "${CLI_DIR}/veracode" ] || { echo "::error::Veracode CLI not found after install."; exit 1; }
+          echo "$CLI_DIR" >> "$GITHUB_PATH"
+          "${CLI_DIR}/veracode" version
+
+      - name: Autopackage repository
+        if: inputs.artifacts_glob == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$AUTOPACK_OUT_DIR"
+          veracode package --source "$IN_PACKAGE_SOURCE" --output "$AUTOPACK_OUT_DIR" --trust
+          ls -lh "$AUTOPACK_OUT_DIR" || true
+
+      - name: Discover artifacts
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=()
+
+          if [ -n "$IN_ARTIFACTS_GLOB" ]; then
+            for f in $IN_ARTIFACTS_GLOB; do
+              [ -f "$f" ] && files+=("$f")
+            done
+          else
+            for ext in $IN_EXTENSIONS; do
+              for f in "$AUTOPACK_OUT_DIR"/*."$ext"; do
+                [ -f "$f" ] && files+=("$f")
+              done
+            done
+          fi
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No scannable artifacts found."
+            ls -l "$AUTOPACK_OUT_DIR" 2>/dev/null || true
+            exit 1
+          fi
+
+          printf '%s\n' "${files[@]}" > artifacts_list.txt
+          echo "count=${#files[@]}" >> "$GITHUB_OUTPUT"
+          echo "Found ${#files[@]} artifact(s):"
+          printf ' - %s\n' "${files[@]}"
+
+      - name: Download Pipeline Scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Always the current scanner. Caching a security tool is not worth the
+          # twenty seconds it saves.
+          curl -fsS --retry 3 --retry-delay 5 -O https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+          unzip -o -q pipeline-scan-LATEST.zip pipeline-scan.jar
+          rm -f pipeline-scan-LATEST.zip
+
+      # Both checkouts happen after packaging so their contents can never be
+      # swept into an artifact by the autopackager.
+      - name: Checkout helper scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repo }}
+          ref: ${{ github.job_workflow_sha }}
+          token: ${{ secrets.CI_PUSH_TOKEN_VCT }}
+          path: .veracode-templates
+          sparse-checkout: scripts
+          fetch-depth: 1
+
+      # Sparse checkout keeps a shared store with hundreds of results cheap.
+      - name: Checkout baseline repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.baseline_repo }}
+          ref: ${{ inputs.baseline_store_branch }}
+          token: ${{ secrets.CI_PUSH_TOKEN_VCT }}
+          path: ${{ env.BASELINE_WORKTREE }}
+          sparse-checkout: ${{ steps.prep.outputs.store_path }}
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+
+      - name: Delta scan
+        if: steps.prep.outputs.is_delta == 'true'
+        id: delta
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          BASE_DIR="${BASELINE_WORKTREE}/${STORE_PATH}"
+          mkdir -p scan-results
+          : > rows.tsv
+          rc_overall=0
+          missing=0
+
+          types=()
+          case "$IN_BASELINE_TYPE" in
+            full)      types=("$BASELINE_FULL") ;;
+            mitigated) types=("$BASELINE_MITIGATED") ;;
+            both)      types=("$BASELINE_FULL" "$BASELINE_MITIGATED") ;;
+          esac
+
+          while IFS= read -r artifact; do
+            [ -z "$artifact" ] && continue
+            name="$(basename "$artifact")"
+            safe="${name//[^A-Za-z0-9_.-]/_}"
+
+            for baseline_name in "${types[@]}"; do
+              label="$name"
+              [ ${#types[@]} -gt 1 ] && label="${name} [${baseline_name%.json}]"
+              BASELINE_PATH="${BASE_DIR}/${safe}/${baseline_name}"
+              RESULTS_PATH="scan-results/${safe}.${baseline_name}"
+
+              if [ ! -f "$BASELINE_PATH" ]; then
+                echo "::warning::No baseline at ${BASELINE_PATH}. Refresh baselines on ${BASELINE_BRANCH} first."
+                printf '%s\t%s\t\n' "$label" "MISSING" >> rows.tsv
+                missing=$((missing + 1))
+                [ "$IN_STRICT" = "true" ] && rc_overall=1
+                continue
+              fi
+
+              echo "::group::Delta scan ${label}"
+              args=(
+                --file "$artifact"
+                --baseline_file "$BASELINE_PATH"
+                --fail_on_severity "$IN_FAIL_ON_SEVERITY"
+                --issue_details true
+                --json_output true
+                --json_output_file "$RESULTS_PATH"
+                --timeout "$IN_TIMEOUT"
+                --project_name "$GITHUB_REPOSITORY"
+                --project_url "$PROJECT_URL"
+                --project_ref "$CURRENT_REF"
+              )
+              [ -n "$IN_FAIL_ON_CWE" ] && args+=(--fail_on_cwe "$IN_FAIL_ON_CWE")
+              [ -n "$IN_POLICY_NAME" ] && args+=(--policy_name "$IN_POLICY_NAME")
+
+              java -jar pipeline-scan.jar "${args[@]}"
+              rc=$?
+              echo "::endgroup::"
+
+              if [ "$rc" -eq 0 ]; then
+                printf '%s\t%s\t%s\n' "$label" "PASSED" "$RESULTS_PATH" >> rows.tsv
+              else
+                echo "::error::Delta scan failed for ${label} (exit ${rc})."
+                printf '%s\t%s\t%s\n' "$label" "FAILED" "$RESULTS_PATH" >> rows.tsv
+                rc_overall=1
+              fi
+            done
+          done < artifacts_list.txt
+
+          {
+            echo "missing=${missing}"
+            echo "rc=${rc_overall}"
+          } >> "$GITHUB_OUTPUT"
+
+          python3 "${HELPERS}/pipeline_summary.py" \
+            --rows rows.tsv \
+            --title "Veracode Delta Scan" \
+            --findings-header "New findings" \
+            --note "Compared against \`${IN_BASELINE_REPO}:${STORE_PATH}\` (baseline branch \`${BASELINE_BRANCH}\`)." \
+            --note "Missing baselines: ${missing}. Gate: ${IN_FAIL_ON_SEVERITY}."
+
+          exit "$rc_overall"
+
+      - name: Install mitigation overlay helper
+        if: steps.prep.outputs.is_baseline == 'true' && steps.prep.outputs.want_mitigated == 'true'
+        shell: bash
+        env:
+          REQUIREMENTS_URL: ${{ inputs.mitigation_requirements_url }}
+          SCRIPT_URL: ${{ inputs.mitigation_script_url }}
+        run: |
+          set -euo pipefail
+          pip install --quiet --disable-pip-version-check -r "$REQUIREMENTS_URL"
+          curl -fsS --retry 3 -o vcpipemit.py "$SCRIPT_URL"
+
+      - name: Create baselines
+        if: steps.prep.outputs.is_baseline == 'true'
+        id: baseline
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          STAGE_DIR="${RUNNER_TEMP}/baseline-stage"
+          MITIG_TMP="${RUNNER_TEMP}/mitigation"
+          rm -rf "$STAGE_DIR" "$MITIG_TMP"
+          mkdir -p "$STAGE_DIR" "$MITIG_TMP"
+          : > rows.tsv
+
+          created=0; mitigated=0; errors=0
+
+          while IFS= read -r artifact; do
+            [ -z "$artifact" ] && continue
+            name="$(basename "$artifact")"
+            safe="${name//[^A-Za-z0-9_.-]/_}"
+            TARGET_DIR="${STAGE_DIR}/${safe}"
+            mkdir -p "$TARGET_DIR"
+            RAW_PATH="${TARGET_DIR}/${BASELINE_FULL}"
+
+            echo "::group::Baseline scan ${name}"
+            args=(
+              --file "$artifact"
+              --issue_details true
+              --json_output true
+              --json_output_file "$RAW_PATH"
+              --timeout "$IN_TIMEOUT"
+              --project_name "$GITHUB_REPOSITORY"
+              --project_url "$PROJECT_URL"
+              --project_ref "$BASELINE_BRANCH"
+            )
+            [ -n "$IN_POLICY_NAME" ] && args+=(--policy_name "$IN_POLICY_NAME")
+
+            # A baseline run records state, it never gates, so the exit code
+            # only matters as far as it produced a results file.
+            java -jar pipeline-scan.jar "${args[@]}"
+            rc=$?
+            echo "::endgroup::"
+
+            if [ ! -s "$RAW_PATH" ]; then
+              echo "::error::No results produced for ${name} (exit ${rc})."
+              printf '%s\t%s\t\n' "$name" "ERROR" >> rows.tsv
+              errors=$((errors + 1))
+              continue
+            fi
+
+            created=$((created + 1))
+            printf '%s\t%s\t%s\n' "$name" "CREATED" "$RAW_PATH" >> rows.tsv
+
+            if [ "$WANT_MITIGATED" = "true" ]; then
+              MIT_PATH="${TARGET_DIR}/${BASELINE_MITIGATED}"
+              # vcpipemit.py always drops vcpipmit.log into the working
+              # directory, so run it from scratch space and keep that log out
+              # of the baseline store.
+              ( cd "$MITIG_TMP" && python3 "${GITHUB_WORKSPACE}/vcpipemit.py" \
+                  --results "$RAW_PATH" \
+                  --applicationname "$APP_NAME" \
+                  --outputfilename "$MIT_PATH" )
+              if [ -s "$MIT_PATH" ]; then
+                mitigated=$((mitigated + 1))
+              else
+                echo "::warning::Mitigation overlay produced nothing for ${name}."
+                errors=$((errors + 1))
+              fi
+            fi
+          done < artifacts_list.txt
+
+          if [ "$created" -eq 0 ]; then
+            echo "::error::No baselines were produced. Stored baselines are left untouched."
+            exit 1
+          fi
+
+          {
+            echo "stage_dir=${STAGE_DIR}"
+            echo "created=${created}"
+            echo "mitigated=${mitigated}"
+            echo "errors=${errors}"
+          } >> "$GITHUB_OUTPUT"
+
+          python3 "${HELPERS}/pipeline_summary.py" \
+            --rows rows.tsv \
+            --title "Veracode Baseline Refresh" \
+            --findings-header "Findings recorded" \
+            --note "Stored at \`${IN_BASELINE_REPO}:${STORE_PATH}\` for baseline branch \`${BASELINE_BRANCH}\`." \
+            --note "Mitigation aware baselines: ${mitigated}. Errors: ${errors}."
+
+      - name: Commit baselines
+        if: steps.prep.outputs.is_baseline == 'true'
+        shell: bash
+        env:
+          STAGE_DIR: ${{ steps.baseline.outputs.stage_dir }}
+        run: |
+          set -euo pipefail
+          cd "$BASELINE_WORKTREE"
+
+          git config user.email "veracode-bot@users.noreply.github.com"
+          git config user.name "Veracode Baseline Bot"
+          BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+
+          for attempt in 1 2 3 4 5; do
+            # Re-apply on top of whatever is on the remote right now. Several
+            # repos can refresh baselines into the same store at once.
+            git fetch --depth=1 origin "$BRANCH"
+            git reset --hard FETCH_HEAD
+
+            # Replace the whole branch key so artifacts that disappeared from
+            # the build stop lingering as stale baselines.
+            rm -rf "${STORE_PATH:?}"
+            mkdir -p "$STORE_PATH"
+            cp -r "${STAGE_DIR}/." "${STORE_PATH}/"
+            git add -A "$STORE_PATH"
+
+            if git diff --cached --quiet; then
+              echo "Baselines unchanged."
+              exit 0
+            fi
+
+            git commit -q \
+              -m "Refresh Veracode baselines for ${GITHUB_REPOSITORY}@${BASELINE_BRANCH} [skip ci]" \
+              -m "Source commit: ${GITHUB_SHA}"
+
+            if git push origin "HEAD:${BRANCH}"; then
+              echo "Pushed baselines on attempt ${attempt}."
+              exit 0
+            fi
+
+            echo "Push rejected, resyncing (attempt ${attempt})."
+            sleep $(( (RANDOM % 5) + 2 ))
+          done
+
+          echo "::error::Could not push baselines after 5 attempts."
+          exit 1
+
+      - name: Publish delta findings to code scanning
+        if: ${{ always() && inputs.upload_sarif && steps.prep.outputs.is_delta == 'true' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(scan-results/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No results to convert."
+            exit 0
+          fi
+          python3 "${HELPERS}/results_to_sarif.py" \
+            --output veracode-results.sarif \
+            --source-path-prefix "$IN_SOURCE_PREFIX" \
+            "${files[@]}"
+
+      - name: Upload SARIF
+        if: ${{ always() && inputs.upload_sarif && steps.prep.outputs.is_delta == 'true' && hashFiles('veracode-results.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: veracode-results.sarif
+          category: veracode-pipeline-scan
+
+      - name: Upload scan results
+        if: ${{ always() && inputs.upload_results }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-${{ steps.prep.outputs.mode }}-results-${{ github.run_attempt }}
+          path: |
+            scan-results/
+            artifacts_list.txt
+            veracode-results.sarif
+          if-no-files-found: ignore
+          retention-days: 14
