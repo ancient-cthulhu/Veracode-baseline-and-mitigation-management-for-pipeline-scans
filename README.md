@@ -1,4 +1,4 @@
-# Veracode CI Templates
+# Veracode Baseline and Mitigations Management for Pipeline Scans
 
 **English** | [Español](README.es.md)
 
